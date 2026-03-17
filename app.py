@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import tempfile
 from langchain_community.document_loaders import PDFPlumberLoader
+from langchain_community.document_loaders import Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -128,10 +129,10 @@ def switch_session(session_id):
         try:
             st.session_state.vectorstore = FAISS.load_local(index_path, embedder, allow_dangerous_deserialization=True)
             
-            # Tìm tên file PDF trong thư mục session
-            pdf_files = [f for f in os.listdir(session_dir) if f.endswith('.pdf')]
-            if pdf_files:
-                st.session_state.processed_file = pdf_files[0]
+            # Tìm tên file tài liệu trong thư mục session (PDF hoặc DOCX)
+            doc_files = [f for f in os.listdir(session_dir) if f.endswith(('.pdf', '.docx', '.doc'))]
+            if doc_files:
+                st.session_state.processed_file = doc_files[0]
             else:
                 st.session_state.processed_file = "Tài liệu từ phiên cũ"
                 
@@ -236,21 +237,28 @@ if st.session_state.vectorstore is not None and st.session_state.processed_file:
         st.rerun()
 else:
     # Hiện khung upload nếu chưa có DB
-    uploaded_file = st.file_uploader("📥 Tải lên tài liệu PDF cho phiên này", type=['pdf'])
+    uploaded_file = st.file_uploader("📥 Tải lên tài liệu (PDF, DOCX, DOC) cho phiên này", type=['pdf', 'docx', 'doc'])
 
     if uploaded_file is not None and uploaded_file.name != st.session_state.processed_file:
         with st.spinner("Đang phân tích và gán AI cho tài liệu..."):
-            # Lưu file PDF và FAISS vào thư mục của session
+            # Lưu file tài liệu và FAISS vào thư mục của session
             session_dir = os.path.join(SESSIONS_DIR, str(st.session_state.current_session_id))
-            pdf_path = os.path.join(session_dir, uploaded_file.name)
+            file_path = os.path.join(session_dir, uploaded_file.name)
             index_path = os.path.join(session_dir, "faiss_index")
             
-            with open(pdf_path, "wb") as f:
+            with open(file_path, "wb") as f:
                 f.write(uploaded_file.read())
             
             try:
                 # Document Loader
-                loader = PDFPlumberLoader(pdf_path)
+                file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+                if file_ext == '.pdf':
+                    loader = PDFPlumberLoader(file_path)
+                elif file_ext in ['.docx', '.doc']:
+                    loader = Docx2txtLoader(file_path)
+                else:
+                    st.error("❌ Định dạng file không được hỗ trợ.")
+                    st.stop()
                 docs = loader.load()
 
                 # Text Splitter
@@ -261,7 +269,7 @@ else:
                 documents = text_splitter.split_documents(docs)
                 
                 if not documents:
-                    st.error("❌ Không tìm thấy văn bản nào trong PDF này. Tài liệu có thể là file scan hoặc bị mã hóa chữ.")
+                    st.error("❌ Không tìm thấy văn bản nào trong tài liệu này. File có thể là bản scan hoặc bị mã hóa chữ.")
                 else:
                     logger.info(f"Processing {len(documents)} chunks")
 
@@ -357,4 +365,4 @@ Answer:"""
                 else:
                     st.error(f"⚠️ Có lỗi từ mô hình AI: {error_msg}")
 else:
-    st.info("💡 Vui lòng tải lên tài liệu PDF để bắt đầu đặt câu hỏi cho phiên này.")
+    st.info("💡 Vui lòng tải lên tài liệu (PDF, DOCX, DOC) để bắt đầu đặt câu hỏi cho phiên này.")
