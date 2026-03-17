@@ -9,6 +9,8 @@ from langchain_community.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 import logging
+import sqlite3
+import datetime
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +38,110 @@ if 'vectorstore' not in st.session_state:
     st.session_state.vectorstore = None
 if 'processed_file' not in st.session_state:
     st.session_state.processed_file = None
+if 'current_session_id' not in st.session_state:
+    st.session_state.current_session_id = None
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'sessions' not in st.session_state:
+    st.session_state.sessions = []
+
+# Đảm bảo thư mục lưu trữ tồn tại
+SESSIONS_DIR = "data/sessions"
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+# Cấu hình database SQLite
+def init_db():
+    conn = sqlite3.connect('chat_history.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(session_id) REFERENCES sessions(id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def create_new_session(title="Cuộc trò chuyện mới"):
+    conn = sqlite3.connect('chat_history.db')
+    c = conn.cursor()
+    c.execute('INSERT INTO sessions (title) VALUES (?)', (title,))
+    session_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    
+    # Tạo thư mục cho session
+    session_dir = os.path.join(SESSIONS_DIR, str(session_id))
+    os.makedirs(session_dir, exist_ok=True)
+    return session_id
+
+def get_all_sessions():
+    conn = sqlite3.connect('chat_history.db')
+    c = conn.cursor()
+    c.execute('SELECT id, title, created_at FROM sessions ORDER BY created_at DESC')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def save_chat(session_id, question, answer):
+    conn = sqlite3.connect('chat_history.db')
+    c = conn.cursor()
+    c.execute('INSERT INTO history (session_id, question, answer) VALUES (?, ?, ?)', 
+              (session_id, question, answer))
+    
+    # Tự động cập nhật tiêu đề session bằng câu hỏi đầu tiên nếu chưa có
+    c.execute('SELECT count(*) FROM history WHERE session_id = ?', (session_id,))
+    if c.fetchone()[0] == 1:
+        new_title = question[:30] + "..." if len(question) > 30 else question
+        c.execute('UPDATE sessions SET title = ? WHERE id = ?', (new_title, session_id))
+        
+    conn.commit()
+    conn.close()
+
+def get_chat_history(session_id):
+    conn = sqlite3.connect('chat_history.db')
+    c = conn.cursor()
+    c.execute('SELECT question, answer, timestamp FROM history WHERE session_id = ? ORDER BY timestamp ASC', (session_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def switch_session(session_id):
+    st.session_state.current_session_id = session_id
+    st.session_state.chat_history = get_chat_history(session_id)
+    # Load lại FAISS index nếu có
+    session_dir = os.path.join(SESSIONS_DIR, str(session_id))
+    index_path = os.path.join(session_dir, "faiss_index")
+    
+    if os.path.exists(index_path):
+        try:
+            st.session_state.vectorstore = FAISS.load_local(index_path, embedder, allow_dangerous_deserialization=True)
+            
+            # Tìm tên file PDF trong thư mục session
+            pdf_files = [f for f in os.listdir(session_dir) if f.endswith('.pdf')]
+            if pdf_files:
+                st.session_state.processed_file = pdf_files[0]
+            else:
+                st.session_state.processed_file = "Tài liệu từ phiên cũ"
+                
+        except Exception as e:
+            st.warning("⚠️ Không thể tải lại dữ liệu tài liệu của phiên này (có thể file lưu trữ bị lỗi hoặc đã bị xóa). Vui lòng tải lên lại tài liệu mới.")
+            st.session_state.vectorstore = None
+            st.session_state.processed_file = None
+    else:
+        st.session_state.vectorstore = None
+        st.session_state.processed_file = None
 
 import torch
 
@@ -62,75 +168,126 @@ def load_llm_model():
 embedder = load_embedding_model()
 llm = load_llm_model()
 
+init_db()
+
+# Cập nhật danh sách session
+st.session_state.sessions = get_all_sessions()
+
+# Chọn session mặc định nếu chưa có
+if st.session_state.current_session_id is None:
+    if len(st.session_state.sessions) > 0:
+        switch_session(st.session_state.sessions[0][0])
+    else:
+        new_id = create_new_session()
+        st.session_state.sessions = get_all_sessions()
+        switch_session(new_id)
+
+
+
 # ============================
 # Cấu trúc giao diện
 # ============================
 
 # Sidebar
 with st.sidebar:
-    st.title("⚙️ Cấu hình hệ thống")
-    st.info("Hệ thống RAG sử dụng Ollama: Qwen2.5:7b và Embedding MPNet đa ngôn ngữ.")
+    st.title("⚙️ SmartDoc Chat")
+    
+    if st.button("➕ Cuộc trò chuyện mới", use_container_width=True):
+        new_id = create_new_session()
+        st.session_state.sessions = get_all_sessions()
+        switch_session(new_id)
+        st.rerun()
+        
     st.markdown("---")
-    st.markdown("### 📝 Hướng dẫn")
-    st.markdown("- Tải lên 1 file PDF (khuyến nghị < 50MB).")
-    st.markdown("- Chờ ứng dụng phân tích.")
-    st.markdown("- Gõ câu hỏi vào thanh Chat.")
+    st.markdown("### 🕒 Lịch sử Chat")
+    
+    for s_id, s_title, s_time in st.session_state.sessions:
+        # Highlight session đang chọn
+        btn_label = f"💬 {s_title}"
+        if s_id == st.session_state.current_session_id:
+            btn_label = f"🟢 {s_title}"
+            
+        if st.button(btn_label, key=f"session_{s_id}", use_container_width=True):
+            switch_session(s_id)
+            st.rerun()
 
 # Main content
 st.markdown("<h1 class='main-title'>SmartDoc AI - Q&A System</h1>", unsafe_allow_html=True)
 st.write("Giải pháp tìm kiếm và sinh câu trả lời theo tài liệu dựa trên Large Language Models.")
 
-# 1. Khu vực Upload
-uploaded_file = st.file_uploader("📥 Tải lên tài liệu PDF của bạn", type=['pdf'])
+# Hiển thị lịch sử chat trong main screen (giống Gemini)
+for q, a, t in st.session_state.chat_history:
+    with st.chat_message("user"):
+        st.write(q)
+    with st.chat_message("assistant"):
+        st.write(a)
 
-if uploaded_file is not None and uploaded_file.name != st.session_state.processed_file:
-    with st.spinner("Đang xử lý tài liệu (Loading & Chunking)..."):
-        # Lưu file tạm để PDFPlumber đọc
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-            temp_file.write(uploaded_file.read())
-            temp_path = temp_file.name
-        
-        try:
-            # Document Loader
-            loader = PDFPlumberLoader(temp_path)
-            docs = loader.load()
+st.markdown("---")
 
-            # Text Splitter
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=100
-            )
-            documents = text_splitter.split_documents(docs)
-            logger.info(f"Processing {len(documents)} chunks")
+# 1. Khu vực Upload hoặc Hiển thị File đã Upload
+if st.session_state.vectorstore is not None and st.session_state.processed_file:
+    # Nếu đã có VectorDB, giấu khung upload đi và hiện thông báo
+    st.success(f"✅ Tài liệu đang sử dụng cho phiên này: **{st.session_state.processed_file}**")
+    
+    # Cho phép xóa để upload file khác
+    if st.button("🔄 Thay thế bằng tài liệu khác", type="secondary"):
+        st.session_state.vectorstore = None
+        st.session_state.processed_file = None
+        st.rerun()
+else:
+    # Hiện khung upload nếu chưa có DB
+    uploaded_file = st.file_uploader("📥 Tải lên tài liệu PDF cho phiên này", type=['pdf'])
 
-            # Khởi tạo Vector Store
-            st.session_state.vectorstore = FAISS.from_documents(documents, embedder)
-            st.session_state.processed_file = uploaded_file.name
-            st.success(f"Đã xử lý xong file: {uploaded_file.name}")
-        except Exception as e:
-            st.error(f"Có lỗi khi xử lý tài liệu: {str(e)}")
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+    if uploaded_file is not None and uploaded_file.name != st.session_state.processed_file:
+        with st.spinner("Đang phân tích và gán AI cho tài liệu..."):
+            # Lưu file PDF và FAISS vào thư mục của session
+            session_dir = os.path.join(SESSIONS_DIR, str(st.session_state.current_session_id))
+            pdf_path = os.path.join(session_dir, uploaded_file.name)
+            index_path = os.path.join(session_dir, "faiss_index")
+            
+            with open(pdf_path, "wb") as f:
+                f.write(uploaded_file.read())
+            
+            try:
+                # Document Loader
+                loader = PDFPlumberLoader(pdf_path)
+                docs = loader.load()
 
-elif uploaded_file is None:
-    # Reset state khi người dùng bấm dấu X tắt file
-    st.session_state.vectorstore = None
-    st.session_state.processed_file = None
+                # Text Splitter
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=100
+                )
+                documents = text_splitter.split_documents(docs)
+                
+                if not documents:
+                    st.error("❌ Không tìm thấy văn bản nào trong PDF này. Tài liệu có thể là file scan hoặc bị mã hóa chữ.")
+                else:
+                    logger.info(f"Processing {len(documents)} chunks")
+
+                    # Khởi tạo và LƯU Vector Store
+                    st.session_state.vectorstore = FAISS.from_documents(documents, embedder)
+                    st.session_state.vectorstore.save_local(index_path)
+                    
+                    st.session_state.processed_file = uploaded_file.name
+                    st.success(f"Đã xử lý và lưu xong tài liệu: {uploaded_file.name}")
+                    st.rerun() # Refresh lại để ẩn khung upload nhanh
+            except Exception as e:
+                st.error(f"⚠️ Có lỗi khi xử lý tài liệu: {str(e)}")
 
 st.markdown("---")
 
 # 2. Khu vực đặt câu hỏi nếu đã xử lý file
-if st.session_state.vectorstore is not None:
-    st.subheader("💡 Đặt câu hỏi về tài liệu")
-    
-    # Bọc trong form để tránh rerun liên tục và dễ dàng clear
-    with st.form(key='qa_form'):
-        user_question = st.text_input("Nhập câu hỏi tại đây:")
-        submit_button = st.form_submit_button(label='Gửi')
+if st.session_state.vectorstore is not None:    
+    # Sử dụng chat_input thay vì form tĩnh giống Gemini
+    user_question = st.chat_input("Hỏi AI về tài liệu của bạn...")
 
-    if submit_button and user_question:
-        with st.spinner("Processing your query..."):
+    if user_question:
+        # Hiển thị câu hỏi ngay lập tức trên UI
+        with st.chat_message("user"):
+            st.write(user_question)
+            
+        with st.spinner("AI đang trả lời..."):
             try:
                 logger.info(f"Query: {user_question}")
                 
@@ -145,24 +302,26 @@ if st.session_state.vectorstore is not None:
                 is_vietnamese = any(char in user_question.lower() for char in vietnamese_chars)
 
                 if is_vietnamese:
-                    prompt_template = """Su dung ngu canh sau day de tra loi cau hoi.
-Neu ban khong biet, chi can noi la ban khong biet.
-Tra loi ngan gon (3-4 cau) BAT BUOC bang tieng Viet.
+                    prompt_template = """Bạn là một trợ lý AI phân tích tài liệu chuyên nghiệp. Nhiệm vụ của bạn là trả lời câu hỏi của người dùng DỰA VÀO NGỮ CẢNH ĐƯỢC CUNG CẤP.
+Tuyệt đối KHÔNG ĐƯỢC bịa đặt thông tin. Nếu trong ngữ cảnh không có thông tin để trả lời, hãy nói "Tôi không tìm thấy thông tin này trong tài liệu".
 
-Ngu canh: {context}
+[NGỮ CẢNH BẮT ĐẦU]
+{context}
+[NGỮ CẢNH KẾT THÚC]
 
-Cau hoi: {question}
-
-Tra loi:"""
+Câu hỏi của người dùng: {question}
+Hãy trả lời câu hỏi trên bằng Tiếng Việt một cách ngắn gọn, súc tích (khoảng 3-4 câu) và sử dụng định dạng Markdown (ví dụ: in đậm, list) nếu cần thiết.
+Trả lời:"""
                 else:
-                    prompt_template = """Use the following context to answer the question.
-If you don't know the answer, just say you don't know.
-Keep answer concise (3-4 sentences).
+                    prompt_template = """You are a professional document analysis AI assistant. Your task is to answer the user's question BASED ON THE PROVIDED CONTEXT.
+Absolutely DO NOT fabricate information. If the context does not contain the information to answer, say "I cannot find this information in the document".
 
-Context: {context}
+[CONTEXT START]
+{context}
+[CONTEXT END]
 
-Question: {question}
-
+User's question: {question}
+Please answer the question concisely (about 3-4 sentences) and use Markdown format (e.g., bold, list) if necessary.
 Answer:"""
 
                 PROMPT = PromptTemplate(
@@ -183,10 +342,19 @@ Answer:"""
                 if "source_documents" in response:
                     logger.info(f"Retrieved {len(response['source_documents'])} documents")
                 
-                # Hiển thị câu trả lời
-                st.markdown("### 🤖 Response:")
-                st.info(response['result'])
+                # Lưu lịch sử hội thoại vào CSDL và cập nhật session state
+                save_chat(st.session_state.current_session_id, user_question, response['result'])
+                st.session_state.chat_history = get_chat_history(st.session_state.current_session_id)
+                st.session_state.sessions = get_all_sessions() # Cập nhật title nếu cần
+                
+                # Hiển thị câu trả lời ngay lập tức
+                with st.chat_message("assistant"):
+                    st.write(response['result'])
             except Exception as e:
-                st.error(f"Có lỗi khi tạo câu trả lời: {str(e)}")
+                error_msg = str(e)
+                if "Connection refused" in error_msg or "Failed to connect" in error_msg:
+                    st.error("🚨 Không thể kết nối đến Ollama. Vui lòng kiểm tra chắc chắn bạn đã bật phần mềm Ollama dưới Local.")
+                else:
+                    st.error(f"⚠️ Có lỗi từ mô hình AI: {error_msg}")
 else:
-    st.warning("Vui lòng upload một file PDF để bắt đầu hệ thống hỏi đáp.")
+    st.info("💡 Vui lòng tải lên tài liệu PDF để bắt đầu đặt câu hỏi cho phiên này.")
